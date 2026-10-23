@@ -1,0 +1,385 @@
+/**
+ * Does PowerShell launch under the workspace-write restricted token, on a
+ * machine with no injection-type AV?
+ *
+ * anywhere-labs/deepseek-harness-desktop#203 split its `0xC0000142` reports
+ * into two branches: the restricted token against the pwsh/.NET startup chain
+ * on its own, and the extra triggering that 火绒 / 360 / enterprise EDR add by
+ * injecting DLLs. Separating them needs a measurement from a machine with no
+ * injecting AV. A GitHub windows-latest runner is exactly that machine.
+ *
+ * This probes process START only, which is what `0xC0000142`
+ * (STATUS_DLL_INIT_FAILED, exit code 3221225794) is about. It deliberately
+ * does not go through the PTY or terminal-bash: a shell that never initializes
+ * its DLLs never reaches them, and adding those layers would only widen the
+ * set of things that could explain a failure.
+ *
+ * SMOKE_CHAIN=node|electron|electron-spawn-node picks which process creates the
+ * restricted token. `electron-spawn-node` is the fix Albertchamberlain proposed
+ * in #203, an Electron parent that hands the runner to a separate Node runtime
+ * instead of loading it in process, so this cell verifies a repair rather than
+ * only locating a fault.
+ * `electron` reproduces the desktop app's launch chain, where the runner is an
+ * `ELECTRON_RUN_AS_NODE` child rather than a plain Node process. That is the
+ * one structural difference between the packaged desktop app and the CLI, and
+ * #203 asked for exactly this comparison.
+ *
+ * Run after `npm run build`: node scripts/pwsh-sandbox-probe.mjs
+ */
+
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { release, version as osVersion } from 'node:os'
+import { join } from 'node:path'
+import process from 'node:process'
+import { Context } from '@deepseek-ai/cordis'
+import LocalSandboxProvider from '@deepseek-ai/dsh-sandbox-local'
+import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+
+/** STATUS_DLL_INIT_FAILED, the code the tracking issue is named after. */
+const DLL_INIT_FAILED = 0xc0000142 // 3221225794 unsigned
+
+/** One line of `key=value` so the report is greppable and diffable. */
+function emit(fields) {
+  console.log(Object.entries(fields).map(([k, v]) => `${k}=${JSON.stringify(String(v))}`).join(' '))
+}
+
+function executionOptions(timeoutMs, extraEnv) {
+  return {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    windowsHide: true,
+    env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+  }
+}
+
+function captureExecution(execute) {
+  try {
+    return { status: 0, signal: null, error: '', stdout: execute().trim(), stderr: '' }
+  } catch (error) {
+    const status = typeof error?.status === 'number' ? error.status : null
+    return {
+      status,
+      signal: error?.signal ?? null,
+      error: status === null ? String(error?.message ?? error) : '',
+      stdout: String(error?.stdout ?? '').trim(),
+      stderr: String(error?.stderr ?? '').trim(),
+    }
+  }
+}
+
+function runNode(args, timeoutMs = 60_000, extraEnv = undefined) {
+  const options = executionOptions(timeoutMs, extraEnv)
+  return captureExecution(() => execFileSync('C:\\hostedtoolcache\\windows\\node\\22.19.0\\x64\\node.exe', args, options))
+}
+
+function runVendoredNode(args, timeoutMs = 60_000, extraEnv = undefined) {
+  const options = executionOptions(timeoutMs, extraEnv)
+  return captureExecution(() => execFileSync('vendored\\node-v20.19.5-win-x64\\node.exe', args, options))
+}
+
+function runElectron(args, timeoutMs = 60_000, extraEnv = undefined) {
+  const options = executionOptions(timeoutMs, extraEnv)
+  return captureExecution(() => execFileSync('node_modules\\electron\\dist\\electron.exe', args, options))
+}
+
+function runPowerShell(shell, args, timeoutMs = 60_000) {
+  const options = executionOptions(timeoutMs)
+  if (shell === 'pwsh') {
+    return captureExecution(() => execFileSync('C:\\Program Files\\PowerShell\\7\\pwsh.exe', args, options))
+  }
+  if (shell === 'powershell51') {
+    return captureExecution(() => execFileSync('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', args, options))
+  }
+  throw new Error(`unsupported PowerShell ${JSON.stringify(shell)}`)
+}
+
+function runGitBash(shell, timeoutMs = 60_000) {
+  const args = ['--noprofile', '--norc', '-c', 'exit 42']
+  const options = executionOptions(timeoutMs)
+  if (shell === 'git-bash-64') {
+    return captureExecution(() => execFileSync('C:\\Program Files\\Git\\usr\\bin\\bash.exe', args, options))
+  }
+  if (shell === 'git-bash-32') {
+    return captureExecution(() => execFileSync('C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe', args, options))
+  }
+  throw new Error(`unsupported Git Bash ${JSON.stringify(shell)}`)
+}
+
+/**
+ * Identify the host the way #203 asked reporters to: build, shell paths and
+ * versions, and whether anything other than Defender is registered. The AV
+ * query is what separates this branch from the injection one, so a failure to
+ * answer it has to be visible rather than silently empty.
+ */
+function describeHost() {
+  emit({ field: 'os', platform: process.platform, osRelease: release() })
+  emit({ field: 'windows_build', ver: osVersion().replace(/\s+/g, ' ') })
+
+  for (const { id, label, path: shellPath } of WINDOWS_SHELLS) {
+    if (!existsSync(shellPath)) {
+      emit({ field: 'shell', shell: label, present: 'no' })
+      continue
+    }
+    const version = runPowerShell(id, ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'])
+    emit({ field: 'shell', shell: label, present: 'yes', path: shellPath, version: version.stdout, versionExit: version.status })
+  }
+
+  // SecurityCenter2 lists every registered AV product, Defender included.
+  // displayName is what tells an injecting product apart from Defender.
+  const av = runPowerShell('powershell51', ['-NoProfile', '-NonInteractive', '-Command',
+    'try { (Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object -ExpandProperty displayName) -join "|" } catch { "QUERY_FAILED: " + $_.Exception.Message }'])
+  emit({ field: 'antivirus', products: av.stdout === '' ? '(none reported)' : av.stdout, exit: av.status })
+}
+
+/** Git Bash, the shell this chain is already known to kill at cygheap init. */
+function findGitBash() {
+  const candidates = [
+    { id: 'git-bash-64', path: 'C:\\Program Files\\Git\\usr\\bin\\bash.exe' },
+    { id: 'git-bash-32', path: 'C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe' },
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(candidate.path)) return candidate
+  }
+  return null
+}
+
+const root = mkdtempSync(join(process.cwd(), '.pwsh-probe-ws-'))
+const writeFenceScript = join(root, 'write-outside.mjs')
+writeFileSync(writeFenceScript, "import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[2], '')\n", 'utf8')
+
+// This probe intentionally targets clean GitHub-hosted Windows runners. Keep
+// executable locations fixed so a workflow environment cannot choose what this
+// diagnostic executes.
+const WINDOWS_SHELLS = [
+  { id: 'pwsh', label: 'pwsh', path: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' },
+  { id: 'powershell51', label: 'powershell51', path: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' },
+]
+
+const ctx = new Context()
+await ctx.plugin(LocalSandboxProvider)
+await ctx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: root })
+
+const CHAIN = process.env.SMOKE_CHAIN ?? 'node'
+const SUPPORTED_CHAINS = new Set(['node', 'electron', 'electron-spawn-node', 'electron-spawn-vendored-node'])
+if (!SUPPORTED_CHAINS.has(CHAIN)) throw new Error(`unsupported SMOKE_CHAIN ${JSON.stringify(CHAIN)}`)
+/**
+ * The normal runner path matches the exact setup-node version in the workflow.
+ * The vendored cell uses the fixed relative path created by the workflow.
+ */
+const USE_VENDORED_NODE = CHAIN === 'electron-spawn-vendored-node'
+const NODE_PATH = USE_VENDORED_NODE
+  ? 'vendored\\node-v20.19.5-win-x64\\node.exe'
+  : 'C:\\hostedtoolcache\\windows\\node\\22.19.0\\x64\\node.exe'
+
+/**
+ * Point the windows-acl rung at an `ELECTRON_RUN_AS_NODE` trampoline instead of
+ * `process.execPath`. `internals` is the provider's own test hook and the argv
+ * contract is unchanged, so only the process that creates the restricted token
+ * differs between the two cells.
+ */
+function useElectronChain(spawnNode) {
+  const electron = 'node_modules\\electron\\dist\\electron.exe'
+  if (!existsSync(electron)) throw new Error('electron binary is missing')
+  const trampoline = join(root, spawnNode ? 'trampoline-spawn.mjs' : 'trampoline.mjs')
+  const common = [
+    "import { pathToFileURL, fileURLToPath } from 'node:url'",
+    "// The desktop trampoline drops the flag before handing off so the runner's",
+    "// own child processes are not themselves Electron-in-node mode.",
+    "for (const k of Object.keys(process.env)) if (k.toUpperCase() === 'ELECTRON_RUN_AS_NODE') delete process.env[k]",
+    "const runner = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/runner'))",
+  ]
+  const body = spawnNode
+    ? [
+        "// Hand the runner to a separate Node runtime. Under ELECTRON_RUN_AS_NODE",
+        "// process.execPath is electron.exe, so the real node comes in by env.",
+        "import { spawnSync } from 'node:child_process'",
+        "const node = process.env.PROBE_NODE_PATH",
+        "if (!node) throw new Error('PROBE_NODE_PATH is required for the spawn-node chain')",
+        "const r = spawnSync(node, [runner, ...process.argv.slice(2)], { stdio: 'inherit' })",
+        "process.exit(r.status === null ? 1 : r.status)",
+      ]
+    : [
+        "// pathToFileURL, not a bare path: on Windows `import('D:\\...')` reads `D:` as a URL scheme.",
+        "await import(pathToFileURL(runner).href)",
+      ]
+  writeFileSync(trampoline, [...common, ...body, ''].join('\n'), 'utf8')
+  ctx.sandbox.internals.windowsAclRunnerArgs = [electron, trampoline]
+  return { electron, trampoline }
+}
+
+/**
+ * The flag only belongs on runs that actually go through the runner. A
+ * `danger-full-access` cell never reaches it, so giving it the flag would make
+ * the control differ from the thing it is controlling for.
+ */
+function runRestricted(argv) {
+  if (CHAIN === 'node') return runNode(argv.slice(1))
+  const env = { ELECTRON_RUN_AS_NODE: '1' }
+  if (CHAIN.startsWith('electron-spawn')) env.PROBE_NODE_PATH = NODE_PATH
+  return runElectron(argv.slice(1), 60_000, env)
+}
+
+/** Crashpad noise #203 already ruled out as a root cause, recorded so the ruling stays checkable. */
+function crashpad(outcome) {
+  return /registration_protocol_win\.cc|crashpad/i.test(outcome.stderr + outcome.stdout) ? 'yes' : 'no'
+}
+
+let electronInfo
+let failures = 0
+try {
+  describeHost()
+  emit({ field: 'chain', chain: CHAIN })
+  if (CHAIN.startsWith('electron')) {
+    electronInfo = useElectronChain(CHAIN.startsWith('electron-spawn'))
+    const v = runElectron(['--version'])
+    emit({ field: 'electron', path: electronInfo.electron, version: v.stdout || v.stderr.slice(0, 80), exit: v.status ?? '(null)' })
+
+    // Discriminator. If Electron-in-node mode cannot run a one-liner on this
+    // host, then every cell below fails for that reason and says nothing about
+    // the runner, the token, or pwsh. Without this the two look identical.
+    const alive = runElectron(['-e', "console.log('alive')"], 60_000, { ELECTRON_RUN_AS_NODE: '1' })
+    const nodeVersion = USE_VENDORED_NODE ? runVendoredNode(['-v']) : runNode(['-v'])
+    emit({ field: 'node_path', path: NODE_PATH, version: nodeVersion.stdout, vendored: CHAIN === 'electron-spawn-vendored-node' ? 'yes' : 'no' })
+    // A node that cannot even print its version would make every confined cell
+    // below fail for that reason, which reads exactly like a sandbox verdict.
+    if (nodeVersion.status !== 0) {
+      emit({ field: 'fatal', error: `the node at ${NODE_PATH} is not runnable (exit ${String(nodeVersion.status)})` })
+      failures += 1
+      throw new Error('unusable node for the spawn chain')
+    }
+    emit({
+      field: 'control_electron_as_node', exit: alive.status ?? '(null)',
+      exitHex: alive.status === null || alive.status === undefined ? '' : '0x' + (alive.status >>> 0).toString(16),
+      stdout: alive.stdout.slice(0, 80), stderr: alive.stderr.slice(0, 200),
+    })
+
+    // And whether the trampoline itself loads the runner at all, unconfined.
+    // `--help` exercises argv parsing without creating a token or spawning.
+    const tramp = runElectron([electronInfo.trampoline, '--help'], 60_000,
+      { ELECTRON_RUN_AS_NODE: '1', PROBE_NODE_PATH: NODE_PATH })
+    emit({
+      field: 'control_trampoline', exit: tramp.status ?? '(null)',
+      exitHex: tramp.status === null || tramp.status === undefined ? '' : '0x' + (tramp.status >>> 0).toString(16),
+      stdout: tramp.stdout.slice(0, 150), stderr: tramp.stderr.slice(0, 250),
+    })
+  }
+
+  // Two positive controls, because "pwsh started" and "the token was never
+  // applied" look identical without them. Both run through the same confine()
+  // call in the same job as the pwsh cells.
+  //
+  // Control A, the write fence. Under workspace-write a write outside the
+  // workspace root has to be refused. If it succeeds, nothing below is a
+  // measurement of a restricted token.
+  {
+    // Not os.tmpdir(): under workspace-write the runner provisions a private
+    // temp child, so a temp path is not reliably "outside". The workspace root
+    // is a mkdtemp child of cwd, so cwd itself is outside the grant.
+    const outside = join(process.cwd(), `probe-outside-${process.pid}.txt`)
+    for (const mode of ['danger-full-access', 'workspace-write']) {
+      // Pass the destination as an argv value to a Node file operation. No
+      // command shell interprets the workspace path.
+      const argv = [NODE_PATH, writeFenceScript, outside]
+      const isConfined = mode !== 'danger-full-access'
+      const confined = isConfined ? ctx.sandbox.confine(argv, { mode, workspaceRoot: root }).argv : argv
+      const args = [writeFenceScript, outside]
+      const outcome = isConfined
+        ? runRestricted(confined)
+        : (USE_VENDORED_NODE ? runVendoredNode(args) : runNode(args))
+      const wrote = existsSync(outside)
+      emit({
+        field: 'control_write_fence', mode, exit: outcome.status ?? '(null)',
+        wroteOutsideWorkspace: wrote ? 'yes' : 'no',
+        stderr: outcome.stderr.slice(0, 200),
+      })
+      rmSync(outside, { force: true })
+      // A fence that does not hold makes the pwsh cells unreadable.
+      if (mode === 'workspace-write' && wrote) failures += 1
+      if (mode === 'danger-full-access' && !wrote) failures += 1
+    }
+  }
+
+  // Control B, MSYS. Git Bash dies at cygheap init under this exact chain
+  // (NtSetInformationToken on TokenDefaultDacl, 0xC0000022) and starts fine
+  // unconfined, so it is a live read on whether the token is doing anything.
+  {
+    const bash = findGitBash()
+    if (bash === null) {
+      emit({ field: 'control_msys', result: 'git_bash_absent' })
+      failures += 1
+    } else {
+      for (const mode of ['danger-full-access', 'workspace-write']) {
+        const argv = [bash.path, '--noprofile', '--norc', '-c', 'exit 42']
+        const isConfined = mode !== 'danger-full-access'
+        const confined = isConfined ? ctx.sandbox.confine(argv, { mode, workspaceRoot: root }).argv : argv
+        const outcome = isConfined ? runRestricted(confined) : runGitBash(bash.id)
+        emit({
+          field: 'control_msys', mode, path: bash.path,
+          exit: outcome.status ?? '(null)',
+          exitHex: outcome.status === null || outcome.status === undefined ? '' : '0x' + (outcome.status >>> 0).toString(16),
+          launched: outcome.status === 42 ? 'yes' : 'no',
+          cygheapDenial: /NtSetInformationToken|cygheap/i.test(outcome.stderr + outcome.stdout) ? 'yes' : 'no',
+          stderr: (outcome.stderr || outcome.stdout).slice(0, 300),
+        })
+      }
+    }
+  }
+
+  for (const { id, label, path: shellPath } of WINDOWS_SHELLS) {
+    if (!existsSync(shellPath)) {
+      emit({ field: 'probe', shell: label, mode: '-', result: 'shell_absent' })
+      continue
+    }
+    // The probe body must not depend on the shell's own semantics beyond
+    // exiting: the question is whether the image starts at all.
+    const shellArgs = ['-NoProfile', '-NonInteractive', '-Command', 'exit 42']
+    const argv = [shellPath, ...shellArgs]
+
+    for (const mode of ['danger-full-access', 'workspace-write']) {
+      // terminal-bash skips the provider entirely for danger-full-access, so
+      // the control has to skip it here too or it would not be the control.
+      let confined = argv
+      let enforcement = 'none (not confined)'
+      const isConfined = mode !== 'danger-full-access'
+      if (isConfined) {
+        // No sessionId: the agentless workspace-write path, where the runner
+        // makes and removes its own random private temp child per invocation.
+        const wrapped = ctx.sandbox.confine(argv, { mode, workspaceRoot: root })
+        confined = wrapped.argv
+        enforcement = wrapped.enforcement
+      }
+      const outcome = isConfined ? runRestricted(confined) : runPowerShell(id, shellArgs)
+      const dllInit = outcome.status === DLL_INIT_FAILED
+      emit({
+        field: 'probe',
+        shell: label,
+        mode,
+        chain: CHAIN,
+        enforcement,
+        exit: outcome.status ?? '(null)',
+        exitHex: outcome.status === null || outcome.status === undefined ? '' : '0x' + (outcome.status >>> 0).toString(16),
+        dllInitFailed: dllInit ? 'yes' : 'no',
+        launched: outcome.status === 42 ? 'yes' : 'no',
+        crashpadNoise: crashpad(outcome),
+        spawnError: outcome.error,
+        stderr: outcome.stderr.slice(0, 300),
+        runner: confined[0],
+      })
+      // A control that cannot start the shell means the host is wrong, not the
+      // sandbox, and reading the workspace-write cell against it would be
+      // meaningless.
+      if (mode === 'danger-full-access' && outcome.status !== 42) failures += 1
+    }
+  }
+} catch (error) {
+  emit({ field: 'fatal', error: String(error && error.stack || error) })
+  failures += 1
+} finally {
+  await ctx.fiber.dispose().catch(() => {})
+  rmSync(root, { recursive: true, force: true })
+}
+
+// The workspace-write cell is the finding, whatever it says, so it never fails
+// the job. Only a broken control does.
+process.exit(failures === 0 ? 0 : 1)

@@ -1,0 +1,12 @@
+research/
+node_modules/
+lib/
+lib/star.mjs
+__pycache__/
+.DS_Store
+launch/
+handoff/
+demo/node_modules/
+demo/_frames/
+session-*.md
+.dsh-win32-star-prompted

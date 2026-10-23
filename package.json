@@ -1,0 +1,131 @@
+{
+  "name": "dsh-win32",
+  "version": "0.17.16",
+  "description": "Fix and diagnose DeepSeek Harness on native Windows. Official PowerShell, Workspace Write, shortcuts, and legacy preset repair. No WSL.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lhg-dsh-plugins/lhg-dsh-win32"
+  },
+  "homepage": "https://github.com/sjh9714/dsh-win32#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-plugins",
+    "deepseek-harness",
+    "deepseek",
+    "windows",
+    "win32",
+    "native-windows",
+    "no-wsl",
+    "workspace-write",
+    "windows-fix",
+    "doctor",
+    "powershell",
+    "sandbox",
+    "git-bash",
+    "persistent-shell",
+    "minimal-mode"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "bin": {
+    "dsh-win32": "bin/cli.mjs"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json",
+    "./fs": {
+      "types": "./lib/fs.d.ts",
+      "default": "./lib/fs.js"
+    },
+    "./fs-confined": {
+      "types": "./lib/fs-confined.d.ts",
+      "default": "./lib/fs-confined.js"
+    }
+  },
+  "files": [
+    "lib",
+    "bin",
+    "preset",
+    "docs/README.zh.md",
+    "docs/windows-details.md",
+    "docs/uninstall.md",
+    "docs/uninstall.zh.md",
+    "assets/demo.gif",
+    "assets/shot-persistent-sandboxed.png",
+    "assets/shot-persistent-gitbash.png",
+    "assets/shot-preset-picker.png",
+    "cordis.patch.yml",
+    "README.en.md"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "prepare": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc -p . --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0 <5",
+    "@deepseek-ai/dsh-fs-local": ">=0.1.0-rc.5 <0.2.0",
+    "@deepseek-ai/dsh-fs-sandbox": ">=0.1.0-rc.5 <0.2.0",
+    "@deepseek-ai/dsh-subprocess-local": ">=0.1.0-rc.5 <0.1.0-rc.7"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-fs": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-fs-local": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-fs-sandbox": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-sandbox-local": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-sandbox-policy": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-subprocess": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-terminal": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-terminal-bash": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "3.18.5",
+    "@types/node": "^22.10.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.7.3",
+    "yaml": "2.9.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-subprocess-local": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-fs-local": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-fs-sandbox": {
+      "optional": true
+    }
+  },
+  "directories": {
+    "doc": "docs",
+    "lib": "lib"
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/sjh9714/dsh-win32/issues"
+  }
+}

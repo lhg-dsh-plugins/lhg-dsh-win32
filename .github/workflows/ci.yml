@@ -1,0 +1,341 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+  # Re-run the installed-stack acceptance against the registry's current
+  # @deepseek-ai/dsh even when this repository has not changed. The scheduled
+  # event uses only Node 22.19, but keeps both npm and strict pnpm layouts.
+  schedule:
+    - cron: '23 17 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run build
+      - run: npm test
+      - name: persistent PTY smoke (the flagship claim, on the real OS)
+        timeout-minutes: 5
+        run: node scripts/pty-smoke.mjs
+      - name: foreground legacy-encoding smoke
+        timeout-minutes: 5
+        run: node scripts/encoding-smoke.mjs
+      - name: inherited foreground pipe drain regression (#78)
+        timeout-minutes: 2
+        run: node scripts/pipe-drain-smoke.mjs
+      - name: foreground resolution smoke (#7)
+        timeout-minutes: 5
+        run: node scripts/foreground-smoke.mjs
+      # Guards the fan-out from #24/#25. It sets up a three-stage pipeline and
+      # fails loudly if the stages do not start, so it cannot pass by failing to
+      # reproduce, which is how a signalling regression would otherwise hide.
+      - name: pipeline signalling smoke (#24)
+        timeout-minutes: 5
+        run: node scripts/pipeline-smoke.mjs
+      - name: doctor + setup smoke
+        shell: bash
+        run: |
+          # dsh-doctor/v1 exit semantics: 0 all pass, 1 any warn, 2 any fail.
+          # A bare runner legitimately warns (no PowerShell 7, no sandboxed
+          # preset yet), so only a fail is a build failure here.
+          set +e
+          node bin/cli.mjs doctor
+          text_code=$?
+          node bin/cli.mjs doctor --json > doctor.json
+          json_code=$?
+          set -e
+          test "$text_code" -lt 2 || { echo "doctor reported a fail (exit $text_code)"; exit 1; }
+          test "$json_code" = "$text_code" || { echo "text exit $text_code but json exit $json_code"; exit 1; }
+          node -e "
+            const e = require('./doctor.json')
+            if (e.schema !== 'dsh-doctor/v1') throw new Error('bad schema ' + e.schema)
+            const counted = e.summary.pass + e.summary.warn + e.summary.fail + e.summary.skip
+            if (counted !== e.checks.length) throw new Error('summary does not add up')
+            for (const c of e.checks) {
+              if (!['pass','warn','fail','skip'].includes(c.status)) throw new Error('bad status ' + c.status)
+              if (c.status === 'skip' && !c.detail) throw new Error('skip without a reason: ' + c.name)
+            }
+            const win = process.platform === 'win32'
+            const names = e.checks.map(c => c.name)
+            for (const n of ['node','dsh_current','git_bash','powershell','koffi','persistent_powershell','workspace_write','sandbox_shell']) {
+              if (!names.includes(n)) throw new Error('missing vocabulary name ' + n)
+            }
+            // Assert the platform rule about skipping, not the exact set.
+            // A check may also skip for its own documented reason regardless
+            // of platform (dsh-win32/bundle does when no profile is wired,
+            // which is the case in CI), so an exact-set assertion breaks every
+            // time an unrelated check gains a skip cell.
+            const skipped = new Set(e.checks.filter(c => c.status === 'skip').map(c => c.name))
+            const winOnly = ['git_bash','koffi','powershell','persistent_powershell','workspace_write','sandbox_shell','write_fence']
+            const missing = winOnly.filter(n => !skipped.has(n))
+            if (!win && missing.length > 0) {
+              throw new Error('non-win32 must skip every win32-only check, did not skip ' + missing)
+            }
+            // Current DSH uses PowerShell, so Git Bash and the legacy preset
+            // write-fence check are intentionally skipped even on Windows.
+            const currentOnly = ['koffi','powershell','persistent_powershell','workspace_write','sandbox_shell']
+            const wrongly = currentOnly.filter(n => skipped.has(n))
+            if (win && wrongly.length > 0) {
+              throw new Error('win32 must not skip its own platform checks, skipped ' + wrongly)
+            }
+            console.log('envelope ok, exit', e.exitCode, JSON.stringify(e.summary))
+          "
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node bin/cli.mjs setup --no-shortcut | grep -q 'current DSH already includes persistent PowerShell'
+            node bin/cli.mjs setup --legacy --no-bundle --no-shortcut
+            grep -q 'bash.exe' "$USERPROFILE/.dsh/.agent-presets/minimal-windows/agent.cordis.yml"
+          else
+            node bin/cli.mjs setup --legacy --bash /bin/bash --no-bundle --no-shortcut
+            grep -q "shellPath: '/bin/bash'" "$HOME/.dsh/.agent-presets/minimal-windows/agent.cordis.yml"
+          fi
+
+  official-live-acceptance:
+    # Gating Windows acceptance on both a flattened npm tree and pnpm's strict
+    # symlink graph. Either layout failing launch, confinement, lifecycle, or
+    # canonical owner resolution blocks the change.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      # Pushes, PRs, and manual runs retain the complete compatibility matrix.
+      # The weekly upstream watch halves runner use by exercising the minimum
+      # supported Node line only; both dependency layouts remain load-bearing.
+      matrix: ${{ fromJSON(github.event_name == 'schedule' && '{"node":["22.19.0"],"installer":["npm","pnpm-strict"]}' || '{"node":["22.19.0","24"],"installer":["npm","pnpm-strict"]}') }}
+    name: official live acceptance (${{ matrix.installer }}, Node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm run build
+      - name: install pnpm used by the upstream strict graph
+        if: matrix.installer == 'pnpm-strict'
+        run: npm install --global pnpm@11.7.0
+      - name: install current official DSH into an isolated runner tree
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          $official = Join-Path $env:RUNNER_TEMP "dsh-official"
+          if ('${{ matrix.installer }}' -eq 'npm') {
+            # The current official graph can stall npm's cyclic peer resolver.
+            # The supported workaround still produces the flattened npm tree
+            # whose installed component chain this lane is meant to validate.
+            npm install --prefix $official --install-strategy=hoisted --legacy-peer-deps --foreground-scripts --no-audit --no-fund @deepseek-ai/dsh@latest
+            if ($LASTEXITCODE -ne 0) { throw 'official DSH installation failed' }
+            # legacy-peer-deps deliberately omits peer-only runtime seams.
+            # Read the installed owners' declarations: newer DSH releases may
+            # remove or rename packages (code-runtime became ptc-runtime).
+            # Repeat for newly installed peers, with a bounded failure path.
+            $dshManifest = Join-Path $official 'node_modules/@deepseek-ai/dsh/package.json'
+            $peerRounds = 0
+            while ($true) {
+              $runtimePeers = @(node scripts/official-runtime-peers.mjs $dshManifest)
+              if ($LASTEXITCODE -ne 0) { throw 'could not inspect installed DSH runtime peers' }
+              if ($runtimePeers.Count -eq 0) { break }
+              if ($peerRounds -ge 5) { throw 'official DSH runtime peers did not converge' }
+              npm install --prefix $official --save-exact --install-strategy=hoisted --legacy-peer-deps --foreground-scripts --no-audit --no-fund @runtimePeers
+              if ($LASTEXITCODE -ne 0) { throw 'official DSH runtime peer installation failed' }
+              $peerRounds++
+            }
+          } else {
+            New-Item -ItemType Directory -Force -Path $official | Out-Null
+            '{"name":"dsh-live-acceptance","version":"0.0.0","private":true}' | Set-Content -Encoding utf8 (Join-Path $official 'package.json')
+            # pnpm 11 reads project and build policy from pnpm-workspace.yaml,
+            # not .npmrc. Keep the graph strict and approve only the native
+            # scripts required by the current official DSH dependency graph.
+            # Keep pnpm's 24-hour publication cooldown. Its selected DSH may
+            # lag npm's latest; verify reports the installed identity, not a
+            # claim that both installers tested the same release.
+            @(
+              'nodeLinker: isolated',
+              'hoist: false',
+              'shamefullyHoist: false',
+              'strictDepBuilds: true',
+              'minimumReleaseAge: 1440',
+              'minimumReleaseAgeStrict: true',
+              'allowBuilds:',
+              "  '@deepseek-ai/dsh-subprocess-local': true",
+              "  '@google/genai': true",
+              '  koffi: true',
+              '  node-pty: true',
+              '  protobufjs: true'
+            ) | Set-Content -Encoding utf8 (Join-Path $official 'pnpm-workspace.yaml')
+            pnpm --dir $official add --save-exact @deepseek-ai/dsh@latest
+          }
+      - name: live persistent PowerShell + Workspace Write acceptance
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          $official = Join-Path $env:RUNNER_TEMP "dsh-official"
+          $env:DSH_WIN32_VERIFY_DSH = Join-Path $official "node_modules/@deepseek-ai/dsh/package.json"
+          node bin/cli.mjs verify
+      - name: opt-in setup verification on the same installed stack
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          $official = Join-Path $env:RUNNER_TEMP "dsh-official"
+          $env:DSH_WIN32_VERIFY_DSH = Join-Path $official "node_modules/@deepseek-ai/dsh/package.json"
+          $env:DSH_HOME = Join-Path $env:RUNNER_TEMP "setup-verify-isolated-home"
+          node bin/cli.mjs setup --verify --profile acceptance --no-shortcut
+          if ($LASTEXITCODE -ne 0) { throw "setup --verify failed with exit $LASTEXITCODE" }
+          if (Test-Path $env:DSH_HOME) { throw 'setup verification unexpectedly wrote profile data' }
+
+  sandbox-experiment:
+    if: github.event_name != 'schedule'
+    # First-ever exercise of the win32 sandboxed persistent-shell path
+    # (core CI excludes terminal-bash and sandbox-local on win32).
+    # Known failing signatures are accepted inside the regression-watch step;
+    # a new signature is a real failure and now reaches the shared CI gate.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run build
+      - name: sandboxed PTY (danger-full-access control)
+        timeout-minutes: 6
+        run: node scripts/sandbox-smoke.mjs
+        env:
+          SANDBOX_MODE: danger-full-access
+      - name: workspace-write regression watch (known MSYS failure signature)
+        timeout-minutes: 6
+        shell: bash
+        env:
+          SANDBOX_MODE: workspace-write
+        run: |
+          set +e
+          out=$(node scripts/sandbox-smoke.mjs 2>&1)
+          code=$?
+          echo "$out" | tail -5
+          if [ $code -eq 0 ]; then
+            echo "NEWS: workspace-write persistent shell now WORKS on win32 (was known-broken)"
+            exit 0
+          elif echo "$out" | grep -qE "TokenDefaultDacl|signal pipe"; then
+            echo "reproduced the documented MSYS restricted-token failure (expected)"
+            exit 0
+          elif echo "$out" | grep -q "marker .* not seen"; then
+            # MSYS dies before ConPTY flushes its stderr on some runs; the
+            # documented failure with a raced-away signature.
+            echo "reproduced the MSYS failure (output raced away, known-flaky)"
+            exit 0
+          else
+            echo "NEW failure mode (signature changed) — investigate"
+            exit 1
+          fi
+
+  busybox-sandboxed:
+    if: github.event_name != 'schedule'
+    # v0.4 flagship proof: busybox-w32 ash survives the WRITE_RESTRICTED token
+    # where MSYS bash dies at cygheap init. Gate passed 2026-08-16; now required.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run build
+      - name: fetch pinned busybox-w32
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'busybox-w32.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'busybox-w32'
+          curl.exe -fL --retry 5 --retry-all-errors --retry-delay 2 -o $archive https://community.chocolatey.org/api/v2/package/busybox/5579.0.0
+          if ($LASTEXITCODE -ne 0) { throw "busybox-w32 download failed with exit $LASTEXITCODE" }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          Copy-Item (Join-Path $extract 'tools/busybox64.exe') ./busybox64.exe
+          $actual = (Get-FileHash ./busybox64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '1255109d6335adf8374888f9c9fc70221f098cb6bf03f183e710e71179ecad78'
+          if ($actual -ne $expected) { throw "busybox-w32 checksum mismatch: $actual" }
+          ./busybox64.exe sh -c 'echo busybox alive'
+          if ($LASTEXITCODE -ne 0) { throw "busybox-w32 smoke failed with exit $LASTEXITCODE" }
+      - name: busybox ash under danger-full-access (control)
+        timeout-minutes: 6
+        shell: bash
+        run: SMOKE_BASH="$PWD/busybox64.exe" SMOKE_SHELL_ARGS="sh,-i" SANDBOX_MODE=danger-full-access node scripts/sandbox-smoke.mjs
+      - name: busybox ash under workspace-write (the gate)
+        timeout-minutes: 6
+        shell: bash
+        run: SMOKE_BASH="$PWD/busybox64.exe" SMOKE_SHELL_ARGS="sh,-i" SANDBOX_MODE=workspace-write node scripts/sandbox-smoke.mjs
+      - name: legacy setup --sandboxed installs the busybox preset
+        shell: bash
+        run: |
+          node bin/cli.mjs setup --legacy --no-bundle --sandboxed --busybox "$PWD/busybox64.exe"
+          grep -q 'busybox64.exe' "$USERPROFILE/.dsh/.agent-presets/minimal-windows-sandboxed/agent.cordis.yml"
+
+  codeql:
+    if: github.event_name != 'schedule'
+    name: CodeQL (JavaScript and TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+
+  ci-gate:
+    # One stable branch-protection context. `always()` makes cancellation and
+    # failure visible here instead of leaving this job skipped behind a failed
+    # dependency. A scheduled run intentionally omits repository-owned tests
+    # and CodeQL, but never omits the current-official compatibility gate.
+    if: always()
+    name: ci gate
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - official-live-acceptance
+      - sandbox-experiment
+      - busybox-sandboxed
+      - codeql
+    steps:
+      - name: require every applicable gate to succeed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_RESULT: ${{ needs.test.result }}
+          OFFICIAL_RESULT: ${{ needs.official-live-acceptance.result }}
+          SANDBOX_RESULT: ${{ needs.sandbox-experiment.result }}
+          BUSYBOX_RESULT: ${{ needs.busybox-sandboxed.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_success() {
+            if [ "$2" != success ]; then
+              echo "$1 finished with $2; expected success"
+              return 1
+            fi
+          }
+
+          failed=0
+          require_success official-live-acceptance "$OFFICIAL_RESULT" || failed=1
+          if [ "$EVENT_NAME" != schedule ]; then
+            require_success test "$TEST_RESULT" || failed=1
+            require_success sandbox-experiment "$SANDBOX_RESULT" || failed=1
+            require_success busybox-sandboxed "$BUSYBOX_RESULT" || failed=1
+            require_success codeql "$CODEQL_RESULT" || failed=1
+          fi
+          exit "$failed"

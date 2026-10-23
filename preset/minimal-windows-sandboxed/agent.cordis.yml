@@ -1,0 +1,74 @@
+# The `minimal-windows-sandboxed` agent preset: Minimal on Windows that
+# STAYS inside the workspace-write ACL sandbox.
+#
+# MSYS bash dies under the WRITE_RESTRICTED token (cygheap TokenDefaultDacl
+# 0xC0000022), so the Git Bash variant needs danger-full-access. busybox-w32
+# ash has no cygheap and survives the restricted token — measured on
+# windows-latest CI. Trade-off: ash, not bash (no arrays, no [[ ]]).
+#
+# `__DSH_WINDOWS_BASH__` is substituted with the busybox path by
+# `npx dsh-win32 setup --sandboxed` (downloads busybox-w32, GPLv2, on consent).
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    # Keep both keys equal: rc.6 reads text; newer persona versions read prefix.
+    prefix: You are a helpful software engineer assistant.
+    text: You are a helpful software engineer assistant.
+    complete: true
+    includeRuntimeContext: false
+
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      config:
+        timeoutMs: 300000
+        shellPath: '__DSH_WINDOWS_BASH__'
+        shellArgs: ['sh', '-i']
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a bash shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * You don't have access to the internet via this tool.
+          * You do have access to a mirror of common linux and python packages via apt and pip.
+          * State is persistent across command calls and discussions with the user.
+          * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    # dsh-win32/fs-confined = fs-sandbox plus transparent GBK/UTF-16 READ
+    # decoding (legacy files edit back as UTF-8; documented in the README).
+    #
+    # Stock minimal mounts the BARE fs-local here, which reports no
+    # sandboxMode, and tool-str-replace-editor reads exactly that to decide
+    # whether to build a MutationPolicy. With the bare backend there is none,
+    # so the editor can rewrite any absolute path on the box while the badge
+    # still says Read Only (deepseek-harness#2066). This preset is the
+    # sandboxed one, so it gets the confining backend and a real write fence.
+    - id: fs-win32
+      name: 'dsh-win32/fs-confined'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000

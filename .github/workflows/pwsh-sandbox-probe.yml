@@ -1,0 +1,78 @@
+# Does PowerShell start under the workspace-write restricted token when no
+# injecting AV is present?
+#
+# anywhere-labs/deepseek-harness-desktop#203 asked reporters to separate the
+# restricted token / pwsh startup chain from the extra triggering that 火绒,
+# 360 and enterprise EDR add by injecting DLLs. A windows-latest runner carries
+# Defender and nothing that injects, so it answers the first branch on its own.
+#
+# Manual only. It exists to produce one report, not to run on every push.
+name: pwsh sandbox probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # yxccai/dsh-desktop#1 ran the same comparison on Windows 10 22H2
+        # (build 19045) and did not reproduce the failure, while every cell
+        # here was build 26100. Whether the fault is gated on the OS build is
+        # now load bearing, since anywhere-labs#266 is vendoring ~87MB of Node
+        # to avoid it. windows-2022 is build 20348, windows-2025 is 26100.
+        os: [windows-2022, windows-2025]
+        # Which process creates the restricted token. `node` is the CLI shape.
+        # `electron` is the packaged desktop shape, where the runner is an
+        # ELECTRON_RUN_AS_NODE child. That is the only structural difference
+        # between the two, so it is the cell #203 needs.
+        # electron-spawn-node is the repair #203 proposed, an Electron parent
+        # that hands the runner to a separate Node runtime instead of loading
+        # it in process. It turns this matrix from a diagnosis into a check on
+        # whether the proposed fix actually holds.
+        # electron-spawn-vendored-node answers whether the repair depends on
+        # WHICH Node runs the runner. It uses a different major downloaded
+        # straight from nodejs.org into its own directory, which is the shape a
+        # packaged desktop app would ship, rather than the one already on PATH.
+        chain: ['node', 'electron']
+    name: ${{ matrix.os }} chain ${{ matrix.chain }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - run: npm install
+      # Not saved to package.json: electron is only needed to reproduce the
+      # desktop launch chain, never to run or build the plugin. Version pinned
+      # to what the desktop app ships (#203).
+      - name: install electron
+        if: startsWith(matrix.chain, 'electron')
+        run: npm install --no-save electron@43.4.0
+      # Electron 43 downloads its platform binary lazily from require(). The
+      # probe executes a fixed literal path, so materialize and verify it here
+      # without passing the resolved path through the workflow environment.
+      - name: materialize electron binary
+        if: startsWith(matrix.chain, 'electron')
+        run: node -e "const fs = require('node:fs'); const electron = require('electron'); fs.accessSync(electron); console.log(electron)"
+      - name: vendor an unrelated official node
+        if: matrix.chain == 'electron-spawn-vendored-node'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=v20.19.5
+          curl -fsSL -o node.zip "https://nodejs.org/dist/$ver/node-$ver-win-x64.zip"
+          unzip -q node.zip -d vendored
+          # The probe derives this fixed workspace path itself. Do not pass an
+          # executable path through the environment.
+          "./vendored/node-$ver-win-x64/node.exe" -v
+      - run: npm run build
+      # The probe never fails on the workspace-write result: that cell is the
+      # finding either way. It exits non-zero only when the unconfined control
+      # cannot start the shell, which would mean the host is wrong.
+      - name: probe
+        timeout-minutes: 10
+        env:
+          SMOKE_CHAIN: ${{ matrix.chain }}
+        run: node scripts/pwsh-sandbox-probe.mjs

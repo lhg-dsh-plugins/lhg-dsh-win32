@@ -1,0 +1,67 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '03:10'
+      timezone: Asia/Seoul
+    open-pull-requests-limit: 5
+    # These fixtures must move together with the legacy <rc.7 subprocess
+    # support boundary. Newer terminal-bash versions require subprocess rc.8.
+    ignore:
+      # Type-check against the oldest supported Node major, not newer APIs.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+      # These 0.1 fixtures share peers with the rc.6 subprocess graph. Moving
+      # only this subset to 0.2 causes ERESOLVE (see #100). Review cross-minor
+      # upgrades together with the legacy support boundary, not in this group.
+      - dependency-name: '@deepseek-ai/dsh-agent'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      - dependency-name: '@deepseek-ai/dsh-fs'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      - dependency-name: '@deepseek-ai/dsh-fs-local'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      - dependency-name: '@deepseek-ai/dsh-sandbox-local'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      - dependency-name: '@deepseek-ai/dsh-session'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      - dependency-name: '@deepseek-ai/dsh-terminal'
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      # Keep the legacy filesystem/sandbox fixtures alongside subprocess rc.6.
+      # Current official components have their own live acceptance lane.
+      - dependency-name: '@deepseek-ai/dsh-fs-sandbox'
+        versions: ['>=0.1.0-rc.7']
+      - dependency-name: '@deepseek-ai/dsh-sandbox-policy'
+        versions: ['>=0.1.0-rc.7']
+      - dependency-name: '@deepseek-ai/dsh-subprocess'
+        versions: ['>=0.1.0-rc.7']
+      - dependency-name: '@deepseek-ai/dsh-subprocess-local'
+        versions: ['>=0.1.0-rc.7']
+      - dependency-name: '@deepseek-ai/dsh-terminal-bash'
+        versions: ['>=0.1.0-rc.7']
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '03:20'
+      timezone: Asia/Seoul
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch

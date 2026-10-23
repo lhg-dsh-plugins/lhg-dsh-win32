@@ -1,0 +1,3 @@
+name: Minimal (Windows)
+description: Persistent Git Bash Minimal. NEEDS danger-full-access (MSYS dies in the workspace-write sandbox — use the sandboxed variant there). 需要 danger-full-access；沙箱内请用 sandboxed 变体。
+order: 4

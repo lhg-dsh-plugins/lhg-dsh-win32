@@ -1,0 +1,75 @@
+# The `minimal-windows` agent preset: the official Minimal composition,
+# runnable on Windows.
+#
+# Faithful to the shipped `minimal` preset (same complete persona, same two
+# tools, no compaction) with exactly one change: the persistent PTY shell is
+# Git Bash instead of /bin/bash. Requires the dsh-windows bundle (it supplies
+# the Windows process inspector the PTY path needs).
+#
+# `__DSH_WINDOWS_BASH__` is substituted with the detected Git Bash path by
+# `npx dsh-windows setup`.
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    # Keep both keys equal: rc.6 reads text; newer persona versions read prefix.
+    prefix: You are a helpful software engineer assistant.
+    text: You are a helpful software engineer assistant.
+    complete: true
+    includeRuntimeContext: false
+
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      config:
+        timeoutMs: 300000
+        shellPath: '__DSH_WINDOWS_BASH__'
+        shellArgs: ['--noprofile', '--norc', '-i']
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a bash shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * You don't have access to the internet via this tool.
+          * You do have access to a mirror of common linux and python packages via apt and pip.
+          * State is persistent across command calls and discussions with the user.
+          * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    # dsh-win32/fs-confined = fs-sandbox plus transparent GBK/UTF-16 READ
+    # decoding (legacy files edit back as UTF-8; documented in the README).
+    #
+    # This preset needs danger-full-access for its SHELL, because MSYS bash
+    # cannot start under the restricted token. The EDITOR is a separate tool
+    # and works regardless, so a session left on Read Only would otherwise get
+    # a broken shell next to an editor that can rewrite anything on the box
+    # (deepseek-harness#2066). Under danger-full-access the fence is a
+    # pass-through, so mounting it here costs nothing in the intended mode and
+    # closes the hole in the unintended one.
+    - id: fs-win32
+      name: 'dsh-win32/fs-confined'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000
